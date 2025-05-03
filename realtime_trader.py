@@ -47,7 +47,7 @@ class NotionLogger:
                     },
                     "Signal": {
                         "select": {
-                            "name": trade_data['signal']
+                            "name": trade_data.get('signal', 'HOLD')
                         }
                     },
                     "Position": {
@@ -113,6 +113,9 @@ class MRHATradingSystem:
         # Trading parameters
         self.position = 0
         logger.info(f"MRHATradingSystem initialized for {symbol}")
+        
+        # Send initial status update
+        self.send_status_update("STARTUP")
         
     def handle_error(self, error_msg, exception=None):
         """Handle errors with proper logging and error counting"""
@@ -279,6 +282,53 @@ Total Portfolio Value: {trade_data['total_value']:,.2f} KRW
         except Exception as e:
             print(f"Error printing status: {e}")
     
+    def send_status_update(self, event_type):
+        """Send status update to Slack and Notion"""
+        try:
+            # Get current balances and position
+            krw_balance = self.get_balance("KRW")
+            coin_balance = self.get_balance(self.symbol.split('-')[1])
+            current_price = self.get_current_price()
+            
+            # Prepare status message
+            status_data = {
+                'time': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                'event_type': event_type,
+                'position': 'LONG' if coin_balance > 0 else 'NO_POSITION',
+                'krw_balance': krw_balance,
+                'coin_balance': coin_balance,
+                'price': current_price,
+                'total_value': (coin_balance * current_price) + krw_balance if current_price else krw_balance
+            }
+            
+            # Set signal based on event type
+            if event_type == "STARTUP":
+                status_data['signal'] = "STARTUP"
+            elif event_type == "SHUTDOWN" or event_type == "ERROR_SHUTDOWN":
+                status_data['signal'] = "END"
+            else:  # For MRHA signals
+                status_data['signal'] = event_type.split('_')[-1]  # Extract BUY/SELL/HOLD
+            
+            # Send to Slack
+            slack_message = f"""
+=== System Status Update ===
+Time: {status_data['time']}
+Event: {status_data['event_type']}
+Signal: {status_data['signal']}
+Position: {status_data['position']}
+KRW Balance: {status_data['krw_balance']:,.2f} KRW
+Coin Balance: {status_data['coin_balance']:.8f} {self.symbol.split('-')[1]}
+Current Price: {status_data['price']:,.2f} KRW
+Total Portfolio Value: {status_data['total_value']:,.2f} KRW
+========================"""
+            self.slack_notifier.send_message(slack_message)
+            
+            # Log to Notion
+            self.notion_logger.log_trade(status_data)
+            
+        except Exception as e:
+            logger.error(f"Error sending status update: {e}")
+    
     def calculate_mrha(self):
         """Calculate MRHA indicators with resource management"""
         try:
@@ -308,6 +358,9 @@ Total Portfolio Value: {trade_data['total_value']:,.2f} KRW
             
             signal = df.iloc[-1]['Signal']
             logger.info(f"MRHA signal calculated: {signal}")
+            
+            # Send status update for MRHA signal
+            self.send_status_update(f"MRHA_SIGNAL_{signal}")
             
             # Clean up DataFrame
             del df
@@ -410,6 +463,7 @@ def main():
         # Set up signal handlers for graceful shutdown
         def signal_handler(signum, frame):
             logger.info(f"Received signal {signum}, initiating graceful shutdown")
+            trader.send_status_update("SHUTDOWN")
             trader.running = False
             
         signal.signal(signal.SIGINT, signal_handler)
@@ -420,8 +474,10 @@ def main():
         
     except KeyboardInterrupt:
         logger.info("Trading system stopped by user")
+        trader.send_status_update("SHUTDOWN")
     except Exception as e:
         logger.critical(f"Critical error in main function: {e}", exc_info=True)
+        trader.send_status_update("ERROR_SHUTDOWN")
         raise
     finally:
         logger.info("MRHA Trading System shutdown complete")
